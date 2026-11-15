@@ -68,6 +68,21 @@ jobs:
       - name: Deployment history
         run: node_modules/.bin/wrangler deployments list --name "$WORKER_NAME" || true
 
+      - name: Current deployment status
+        run: node_modules/.bin/wrangler deployments status --name "$WORKER_NAME" || true
+
+      - name: Account inventory
+        run: |
+          set -uo pipefail
+          echo "Workers in this account:"
+          curl -sS "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            | jq -r '.result[]?.id' || true
+          echo "Custom domains (hostname -> worker):"
+          curl -sS "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/domains" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            | jq -r '.result[]? | "  \(.hostname) -> \(.service)"' || true
+
       - name: Version history
         run: node_modules/.bin/wrangler versions list --name "$WORKER_NAME" || true
 
@@ -107,5 +122,5 @@ jobs:
             done
           ) &
           probe_pid=$!
-          timeout "${TAIL_SECONDS}s" node_modules/.bin/wrangler tail "$WORKER_NAME" --format pretty || true
+          timeout "${TAIL_SECONDS}s" node_modules/.bin/wrangler tail "$WORKER_NAME" --format json || true
           wait "$probe_pid" || true
