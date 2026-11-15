@@ -1,0 +1,373 @@
+name: Deploy to Cloudflare Workers
+
+# Builds the Web Vault bundle and deploys NodeWarden to Cloudflare Workers via
+# Wrangler. D1 / R2 / KV resources are created on first use (or reused when they
+# already exist), so a fresh fork only needs two repository secrets:
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+# See .github/DEPLOY_GITHUB_ACTIONS.md for the token permissions and the full
+# runbook.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Attachment storage: r2 (Cloudflare R2) or kv (Cloudflare KV, no credit card needed)"
+        required: true
+        default: r2
+        type: choice
+        options:
+          - r2
+          - kv
+      worker_name:
+        description: "Worker name to deploy to (created on first run)"
+        required: false
+        default: nodewarden
+        type: string
+      custom_domain:
+        description: "Optional custom domain, e.g. vault.example.com (empty = workers.dev URL only)"
+        required: false
+        default: ""
+        type: string
+      d1_database_name:
+        description: "D1 database name (created on first run)"
+        required: false
+        default: nodewarden-db
+        type: string
+      r2_bucket_name:
+        description: "R2 bucket name, used in r2 mode (created on first run)"
+        required: false
+        default: nodewarden-attachments
+        type: string
+      kv_namespace_title:
+        description: "KV namespace title, used in kv mode (created on first run)"
+        required: false
+        default: nodewarden-attachments-kv
+        type: string
+      dry_run:
+        description: "Build and validate only: no Cloudflare resources are created or published"
+        required: false
+        default: false
+        type: boolean
+
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/deploy-workers.yml"
+      - ".github/scripts/prepare-wrangler-config.mjs"
+      - "src/**"
+      - "shared/**"
+      - "webapp/**"
+      - "scripts/**"
+      - "migrations/**"
+      - "package.json"
+      - "package-lock.json"
+      - "wrangler.toml"
+      - "wrangler.kv.toml"
+
+permissions:
+  contents: read
+
+# Deploys must not race each other: two overlapping `wrangler deploy` runs can
+# publish a stale bundle or fight over Durable Object migrations.
+concurrency:
+  group: deploy-cloudflare-workers
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+
+    # Manual runs always deploy. Pushes to main only deploy once the repository
+    # variable CF_AUTO_DEPLOY is set to "true".
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.CF_AUTO_DEPLOY == 'true' }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # A dedicated environment keeps the deployment secrets scoped to this job and
+    # lets you add protection rules (required reviewers, branch restriction)
+    # later without touching the workflow. GitHub creates it on first use.
+    environment: production
+
+    env:
+      DEPLOY_MODE: ${{ inputs.mode || 'r2' }}
+      WORKER_NAME: ${{ inputs.worker_name || 'nodewarden' }}
+      WORKER_DOMAIN: ${{ inputs.custom_domain || '' }}
+      D1_DATABASE_NAME: ${{ inputs.d1_database_name || 'nodewarden-db' }}
+      R2_BUCKET_NAME: ${{ inputs.r2_bucket_name || 'nodewarden-attachments' }}
+      KV_NAMESPACE_TITLE: ${{ inputs.kv_namespace_title || 'nodewarden-attachments-kv' }}
+      # Optional escape hatch: pin existing resources instead of looking them up.
+      D1_DATABASE_ID: ${{ vars.CF_D1_DATABASE_ID || '' }}
+      KV_NAMESPACE_ID: ${{ vars.CF_KV_NAMESPACE_ID || '' }}
+      CI_CONFIG_PATH: wrangler.ci.toml
+      WRANGLER_BIN: node_modules/.bin/wrangler
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version-file: ".node-version"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build Web Vault
+        run: npm run build
+
+      - name: Verify build output
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/index.html ]; then
+            echo "::error::dist/index.html is missing: the Vite build did not produce a deployable bundle."
+            exit 1
+          fi
+          echo "Web Vault bundle:"
+          du -sh dist
+
+      - name: Preflight checks
+        env:
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          failed=0
+
+          case "$DEPLOY_MODE" in
+            r2 | kv) ;;
+            *)
+              echo "::error::DEPLOY_MODE must be r2 or kv, got '$DEPLOY_MODE'."
+              failed=1
+              ;;
+          esac
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: skipping the Cloudflare credential checks."
+            exit 0
+          fi
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Missing repository secret CLOUDFLARE_API_TOKEN. See .github/DEPLOY_GITHUB_ACTIONS.md."
+            failed=1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Missing repository secret CLOUDFLARE_ACCOUNT_ID."
+            failed=1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "Wrangler version:"
+          "$WRANGLER_BIN" --version
+          # Informational only: a token scoped to Workers/D1/R2 can still fail
+          # this call, which would be a false negative for the deployment.
+          "$WRANGLER_BIN" whoami || echo "::warning::wrangler whoami failed; continuing."
+
+      - name: Ensure D1 database
+        id: d1
+        if: ${{ inputs.dry_run != true }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Look the database up by name instead of parsing `d1 create` output,
+          # so the step works across Wrangler versions and never creates a
+          # duplicate database on a re-run.
+          lookup_d1() {
+            "$WRANGLER_BIN" d1 list --json \
+              | jq -r --arg name "$D1_DATABASE_NAME" "[.[] | select(.name == \$name)][0].uuid // empty"
+          }
+
+          d1_id="${D1_DATABASE_ID:-}"
+          if [ -n "$d1_id" ]; then
+            echo "Using the D1 database id from repository variable CF_D1_DATABASE_ID."
+          else
+            d1_id="$(lookup_d1)"
+          fi
+
+          if [ -z "$d1_id" ]; then
+            echo "Creating D1 database '$D1_DATABASE_NAME'..."
+            "$WRANGLER_BIN" d1 create "$D1_DATABASE_NAME"
+            for _ in 1 2 3 4 5; do
+              d1_id="$(lookup_d1)"
+              if [ -n "$d1_id" ]; then
+                break
+              fi
+              sleep 3
+            done
+          fi
+
+          if ! grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' <<< "$d1_id"; then
+            echo "::error::Could not resolve a D1 database id for '$D1_DATABASE_NAME'."
+            exit 1
+          fi
+
+          echo "D1 database id: $d1_id"
+          echo "id=$d1_id" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure R2 bucket
+        if: ${{ inputs.dry_run != true && env.DEPLOY_MODE == 'r2' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if "$WRANGLER_BIN" r2 bucket info "$R2_BUCKET_NAME" >/dev/null 2>&1; then
+            echo "R2 bucket '$R2_BUCKET_NAME' already exists."
+          else
+            echo "Creating R2 bucket '$R2_BUCKET_NAME'..."
+            "$WRANGLER_BIN" r2 bucket create "$R2_BUCKET_NAME"
+          fi
+
+      - name: Ensure KV namespace
+        id: kv
+        if: ${{ inputs.dry_run != true && env.DEPLOY_MODE == 'kv' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          lookup_kv() {
+            "$WRANGLER_BIN" kv namespace list \
+              | jq -r --arg title "$KV_NAMESPACE_TITLE" "[.[] | select(.title == \$title)][0].id // empty"
+          }
+
+          kv_id="${KV_NAMESPACE_ID:-}"
+          if [ -n "$kv_id" ]; then
+            echo "Using the KV namespace id from repository variable CF_KV_NAMESPACE_ID."
+          else
+            kv_id="$(lookup_kv)"
+          fi
+
+          if [ -z "$kv_id" ]; then
+            echo "Creating KV namespace '$KV_NAMESPACE_TITLE'..."
+            "$WRANGLER_BIN" kv namespace create "$KV_NAMESPACE_TITLE"
+            for _ in 1 2 3 4 5; do
+              kv_id="$(lookup_kv)"
+              if [ -n "$kv_id" ]; then
+                break
+              fi
+              sleep 3
+            done
+          fi
+
+          if ! grep -Eq '^[0-9a-fA-F]{32}$' <<< "$kv_id"; then
+            echo "::error::Could not resolve a KV namespace id for '$KV_NAMESPACE_TITLE'."
+            exit 1
+          fi
+
+          echo "KV namespace id: $kv_id"
+          echo "id=$kv_id" >> "$GITHUB_OUTPUT"
+
+      - name: Generate CI Wrangler config
+        env:
+          NW_CONFIG: ${{ env.DEPLOY_MODE == 'kv' && 'wrangler.kv.toml' || 'wrangler.toml' }}
+          NW_OUTPUT: ${{ env.CI_CONFIG_PATH }}
+          NW_WORKER_NAME: ${{ env.WORKER_NAME }}
+          NW_D1_DATABASE_NAME: ${{ env.D1_DATABASE_NAME }}
+          # In a dry run the resource steps are skipped, so placeholders keep the
+          # generated config schema-valid without touching the account.
+          NW_D1_DATABASE_ID: ${{ steps.d1.outputs.id || '00000000-0000-0000-0000-000000000000' }}
+          NW_R2_BUCKET_NAME: ${{ env.R2_BUCKET_NAME }}
+          NW_KV_NAMESPACE_ID: ${{ steps.kv.outputs.id || '00000000000000000000000000000000' }}
+          NW_CUSTOM_DOMAIN: ${{ env.WORKER_DOMAIN }}
+          NW_VARS_JSON: ${{ vars.CF_WORKER_VARS }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/prepare-wrangler-config.mjs
+          echo "::group::Generated $NW_OUTPUT"
+          cat "$NW_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Deploy Worker
+        id: deploy
+        if: ${{ inputs.dry_run != true }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          deploy_log="$(mktemp)"
+
+          # --keep-vars keeps plain-text variables that were configured in the
+          # Cloudflare dashboard (e.g. HIDE_WEB_VAULT) on the deployed Worker.
+          "$WRANGLER_BIN" deploy -c "$CI_CONFIG_PATH" --keep-vars | tee "$deploy_log"
+
+          url="$(grep -oE 'https://[A-Za-z0-9._-]+\.workers\.dev' "$deploy_log" | head -n 1 || true)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Sync JWT_SECRET
+        if: ${{ inputs.dry_run != true }}
+        env:
+          JWT_SECRET_VALUE: ${{ secrets.JWT_SECRET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JWT_SECRET_VALUE:-}" ]; then
+            echo "::warning::Repository secret JWT_SECRET is not set. Any secret already stored on the Worker is kept, but a brand new Worker will report a missing JWT_SECRET until one is configured."
+            exit 0
+          fi
+          printf '%s' "$JWT_SECRET_VALUE" | "$WRANGLER_BIN" secret put JWT_SECRET -c "$CI_CONFIG_PATH" >/dev/null
+          echo "JWT_SECRET is up to date."
+
+      - name: Smoke test deployed Worker
+        if: ${{ inputs.dry_run != true }}
+        continue-on-error: true
+        env:
+          DEPLOYED_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOYED_URL:-}" ]; then
+            echo "No workers.dev URL found in the deploy output; skipping the smoke test."
+            exit 0
+          fi
+
+          # /api/config only answers once D1 has been reached and initialized,
+          # so a 200 proves the deployed bindings actually work.
+          for attempt in 1 2 3 4 5; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${DEPLOYED_URL}/api/config" || true)"
+            echo "Attempt ${attempt}: GET /api/config -> ${status:-no response}"
+            if [ "$status" = "200" ]; then
+              echo "Worker is serving the Bitwarden config endpoint."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::warning::Smoke test against ${DEPLOYED_URL}/api/config did not return HTTP 200. Check the Worker logs plus the D1 and JWT_SECRET configuration."
+
+      - name: Write job summary
+        if: always()
+        env:
+          DEPLOYED_URL: ${{ steps.deploy.outputs.url }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          {
+            echo "### NodeWarden deployment to Cloudflare Workers"
+            echo ""
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| Worker | \`${WORKER_NAME}\` |"
+            echo "| Mode | \`${DEPLOY_MODE}\` |"
+            echo "| D1 database | \`${D1_DATABASE_NAME}\` |"
+            echo "| R2 bucket | \`${R2_BUCKET_NAME:-n/a}\` |"
+            echo "| KV namespace | \`${KV_NAMESPACE_TITLE:-n/a}\` |"
+            echo "| Custom domain | \`${WORKER_DOMAIN:-none}\` |"
+            echo "| URL | ${DEPLOYED_URL:-see the deploy log} |"
+            echo "| Dry run | \`$DRY_RUN\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
