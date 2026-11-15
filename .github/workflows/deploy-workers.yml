@@ -157,28 +157,33 @@ jobs:
               exit 0
             fi
             echo "Dry run: READ-ONLY Cloudflare checks. Nothing is created, uploaded, or deployed."
-            "$WRANGLER_BIN" --version
-            "$WRANGLER_BIN" whoami || echo "::warning::wrangler whoami failed"
-            echo "Visible D1 databases:"
-            "$WRANGLER_BIN" d1 list --json | jq -r '.[] | "  \(.name)  \(.uuid)"' \
+            # This repository is public, so the logs are public too: report the
+            # verdicts and names only, never emails, account ids, or D1 uuids.
+            if "$WRANGLER_BIN" whoami >/dev/null 2>&1; then
+              echo "API token: valid."
+            else
+              echo "::warning::wrangler whoami failed: the token may be invalid, or lack Account Settings:Read."
+            fi
+            echo "D1 databases visible to this token:"
+            "$WRANGLER_BIN" d1 list --json | jq -r '.[] | "  - \(.name)"' \
               || echo "::warning::d1 list failed (the token may lack D1:Read)"
             if [ "$DEPLOY_MODE" = "r2" ]; then
               if "$WRANGLER_BIN" r2 bucket info "$R2_BUCKET_NAME" >/dev/null 2>&1; then
-                echo "R2 bucket '$R2_BUCKET_NAME' is readable."
+                echo "R2 bucket '$R2_BUCKET_NAME': readable."
               else
-                echo "::warning::R2 bucket '$R2_BUCKET_NAME' not found or not readable."
+                echo "::warning::R2 bucket '$R2_BUCKET_NAME' not found or not readable (Workers R2 Storage:Read)."
               fi
             else
               if "$WRANGLER_BIN" kv namespace list | jq -e --arg title "$KV_NAMESPACE_TITLE" "any(.[]; .title == \$title)" >/dev/null 2>&1; then
-                echo "KV namespace '$KV_NAMESPACE_TITLE' is readable."
+                echo "KV namespace '$KV_NAMESPACE_TITLE': readable."
               else
-                echo "::warning::KV namespace '$KV_NAMESPACE_TITLE' not found or not readable."
+                echo "::warning::KV namespace '$KV_NAMESPACE_TITLE' not found or not readable (Workers KV Storage:Read)."
               fi
             fi
             if "$WRANGLER_BIN" deployments list --name "$WORKER_NAME" >/dev/null 2>&1; then
-              echo "Worker '$WORKER_NAME' is readable with this token."
+              echo "Worker '$WORKER_NAME': readable (Workers Scripts:Read)."
             else
-              echo "::warning::Worker '$WORKER_NAME' is not readable with this token (or does not exist yet)."
+              echo "::warning::Worker '$WORKER_NAME' is not readable with this token, or does not exist yet."
             fi
             exit 0
           fi
