@@ -1,18 +1,32 @@
 name: Diagnose Worker
 
-# Temporary read-only diagnostics for a deployed Worker: version history plus a
-# short wrangler tail while the public URL is probed. Nothing is deployed.
+# Read-only diagnostics plus an explicit rollback switch for a deployed Worker.
+# Nothing is deployed: "diagnose" only tails logs, "rollback" repoints the Worker
+# to a previously deployed version.
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: "diagnose (tail logs) or rollback (repoint to an earlier version)"
+        required: true
+        default: diagnose
+        type: choice
+        options:
+          - diagnose
+          - rollback
       worker_name:
         description: "Worker to inspect"
         required: false
         default: nodewarden
         type: string
+      version_id:
+        description: "Version id for rollback (empty = the deployment before the current one)"
+        required: false
+        default: ""
+        type: string
       seconds:
-        description: "How long to capture wrangler tail"
+        description: "How long to capture wrangler tail (diagnose only)"
         required: false
         default: "25"
         type: string
@@ -21,15 +35,18 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
-    name: Diagnose ${{ inputs.worker_name || 'nodewarden' }}
+  worker:
+    name: ${{ inputs.action }} ${{ inputs.worker_name || 'nodewarden' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
 
     env:
+      ACTION: ${{ inputs.action || 'diagnose' }}
       WORKER_NAME: ${{ inputs.worker_name || 'nodewarden' }}
+      VERSION_ID: ${{ inputs.version_id || '' }}
       TAIL_SECONDS: ${{ inputs.seconds || '25' }}
+      WORKER_URL: https://${{ inputs.worker_name || 'nodewarden' }}.interestingfrankking.workers.dev
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
@@ -54,17 +71,41 @@ jobs:
       - name: Version history
         run: node_modules/.bin/wrangler versions list --name "$WORKER_NAME" || true
 
+      - name: Rollback
+        if: ${{ inputs.action == 'rollback' }}
+        run: |
+          set -uo pipefail
+          if [ -n "${VERSION_ID}" ]; then
+            echo "Rolling back $WORKER_NAME to version $VERSION_ID"
+            node_modules/.bin/wrangler rollback "$VERSION_ID" --name "$WORKER_NAME" \
+              --message "rollback from GitHub Actions to $VERSION_ID"
+          else
+            echo "Rolling back $WORKER_NAME to the previous deployment"
+            node_modules/.bin/wrangler rollback --name "$WORKER_NAME" \
+              --message "rollback from GitHub Actions to the previous deployment"
+          fi
+          sleep 8
+          for _ in 1 2 3 4 5; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${WORKER_URL}/api/config" || true)"
+            echo "verify: GET /api/config -> ${status:-no response}"
+            [ "$status" = "200" ] && exit 0
+            sleep 5
+          done
+          echo "::warning::$WORKER_URL still does not return 200 after rollback"
+          exit 0
+
       - name: Tail while probing the worker
+        if: ${{ inputs.action == 'diagnose' }}
         run: |
           set -uo pipefail
           (
             sleep 6
             for _ in 1 2 3; do
               curl -sS -o /dev/null -w 'probe: GET /api/config -> %{http_code}\n' \
-                "https://${WORKER_NAME}.interestingfrankking.workers.dev/api/config" || true
+                "${WORKER_URL}/api/config" || true
               sleep 2
             done
           ) &
           probe_pid=$!
-          timeout "${TAIL_SECONDS}s" node_modules/.bin/wrangler tail --name "$WORKER_NAME" --format pretty || true
+          timeout "${TAIL_SECONDS}s" node_modules/.bin/wrangler tail "$WORKER_NAME" --format pretty || true
           wait "$probe_pid" || true
