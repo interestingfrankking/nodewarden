@@ -202,9 +202,14 @@ jobs:
 
           echo "Wrangler version:"
           "$WRANGLER_BIN" --version
-          # Informational only: a token scoped to Workers/D1/R2 can still fail
-          # this call, which would be a false negative for the deployment.
-          "$WRANGLER_BIN" whoami || echo "::warning::wrangler whoami failed; continuing."
+          # whoami prints the account email and this repository is public, so keep
+          # only the verdict. A token scoped to Workers/D1/R2 can fail this call
+          # even when the deployment itself would succeed, hence the warning.
+          if "$WRANGLER_BIN" whoami >/dev/null 2>&1; then
+            echo "API token: valid."
+          else
+            echo "::warning::wrangler whoami failed; continuing (the deploy step surfaces real auth errors)."
+          fi
 
       - name: Ensure D1 database
         id: d1
