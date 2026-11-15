@@ -29,9 +29,9 @@ on:
         default: ""
         type: string
       smoke_url:
-        description: "Optional URL for the post-deploy smoke test, e.g. https://node.example.com (empty = the workers.dev URL)"
+        description: "URL used by the post-deploy smoke test (defaults to this deployment's public domain)"
         required: false
-        default: ""
+        default: "https://node.106599988.xyz"
         type: string
       d1_database_name:
         description: "D1 database name (created on first run)"
@@ -99,6 +99,10 @@ jobs:
       DEPLOY_MODE: ${{ inputs.mode || 'r2' }}
       WORKER_NAME: ${{ inputs.worker_name || 'nodewarden' }}
       WORKER_DOMAIN: ${{ inputs.custom_domain || '' }}
+      # This account cannot serve *.workers.dev (every Worker returns a Cloudflare
+      # error page), so the smoke test targets the public custom domain instead.
+      # Applies to push-triggered deploys too, where inputs.* is empty.
+      SMOKE_URL: ${{ inputs.smoke_url || 'https://node.106599988.xyz' }}
       D1_DATABASE_NAME: ${{ inputs.d1_database_name || 'nodewarden-db' }}
       R2_BUCKET_NAME: ${{ inputs.r2_bucket_name || 'nodewarden-attachments' }}
       KV_NAMESPACE_TITLE: ${{ inputs.kv_namespace_title || 'nodewarden-attachments-kv' }}
@@ -372,12 +376,10 @@ jobs:
         continue-on-error: true
         env:
           DEPLOYED_URL: ${{ steps.deploy.outputs.url }}
-          SMOKE_URL: ${{ inputs.smoke_url || '' }}
         run: |
           set -euo pipefail
-          # Some accounts cannot serve *.workers.dev at all (every Worker answers
-          # with a Cloudflare error page) while custom domains work fine. Anyone
-          # in that situation passes smoke_url and the test targets it instead.
+          # SMOKE_URL is pinned at job level (custom domain); DEPLOYED_URL is only
+          # a fallback for forks that have not hardcoded a public domain yet.
           target="${SMOKE_URL:-${DEPLOYED_URL:-}}"
           if [ -z "$target" ]; then
             echo "Neither smoke_url nor a workers.dev URL is available; skipping the smoke test."

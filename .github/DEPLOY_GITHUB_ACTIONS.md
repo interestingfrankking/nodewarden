@@ -73,7 +73,7 @@ workflow 会在仓库根目录临时生成一个 `wrangler.ci.toml`（已加入 
 | `mode` | `r2` | 附件存储方式：`r2`（需要绑定支付方式，单文件 100 MB，免费 10 GB）或 `kv`（无需绑卡，单文件 25 MiB，免费 1 GB） |
 | `worker_name` | `nodewarden` | Worker 名称，也是 `https://<名称>.<你的子域>.workers.dev` |
 | `custom_domain` | 空 | 例如 `vault.example.com`；填了会同时绑定自定义域名，域名必须已经托管在同一个 Cloudflare 账号 |
-| `smoke_url` | 空 | 部署后冒烟测试用的地址，例如 `https://node.example.com`；留空则用部署输出里的 `*.workers.dev`。**某些账号的 `workers.dev` 整体不可用**（每个 Worker 都返回 Cloudflare 错误页），这时必须填这一项，否则冒烟测试会误报 |
+| `smoke_url` | `https://node.106599988.xyz` | 部署后冒烟测试用的地址，**已写死为本项目生产域名**（手动触发和 push 触发都用它）。这个账号的 `*.workers.dev` 整体不可用（每个 Worker 都返回 Cloudflare 错误页），所以不能再用它做健康检查；换域名时记得同步改这个默认值 |
 | `d1_database_name` | `nodewarden-db` | D1 数据库名 |
 | `r2_bucket_name` | `nodewarden-attachments` | R2 存储桶名（`r2` 模式） |
 | `kv_namespace_title` | `nodewarden-attachments-kv` | KV 命名空间名称（`kv` 模式） |
