@@ -1,0 +1,70 @@
+name: Diagnose Worker
+
+# Temporary read-only diagnostics for a deployed Worker: version history plus a
+# short wrangler tail while the public URL is probed. Nothing is deployed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_name:
+        description: "Worker to inspect"
+        required: false
+        default: nodewarden
+        type: string
+      seconds:
+        description: "How long to capture wrangler tail"
+        required: false
+        default: "25"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Diagnose ${{ inputs.worker_name || 'nodewarden' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+
+    env:
+      WORKER_NAME: ${{ inputs.worker_name || 'nodewarden' }}
+      TAIL_SECONDS: ${{ inputs.seconds || '25' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version-file: ".node-version"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Deployment history
+        run: node_modules/.bin/wrangler deployments list --name "$WORKER_NAME" || true
+
+      - name: Version history
+        run: node_modules/.bin/wrangler versions list --name "$WORKER_NAME" || true
+
+      - name: Tail while probing the worker
+        run: |
+          set -uo pipefail
+          (
+            sleep 6
+            for _ in 1 2 3; do
+              curl -sS -o /dev/null -w 'probe: GET /api/config -> %{http_code}\n' \
+                "https://${WORKER_NAME}.interestingfrankking.workers.dev/api/config" || true
+              sleep 2
+            done
+          ) &
+          probe_pid=$!
+          timeout "${TAIL_SECONDS}s" node_modules/.bin/wrangler tail --name "$WORKER_NAME" --format pretty || true
+          wait "$probe_pid" || true
