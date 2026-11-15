@@ -28,6 +28,11 @@ on:
         required: false
         default: ""
         type: string
+      smoke_url:
+        description: "Optional URL for the post-deploy smoke test, e.g. https://node.example.com (empty = the workers.dev URL)"
+        required: false
+        default: ""
+        type: string
       d1_database_name:
         description: "D1 database name (created on first run)"
         required: false
@@ -367,17 +372,24 @@ jobs:
         continue-on-error: true
         env:
           DEPLOYED_URL: ${{ steps.deploy.outputs.url }}
+          SMOKE_URL: ${{ inputs.smoke_url || '' }}
         run: |
           set -euo pipefail
-          if [ -z "${DEPLOYED_URL:-}" ]; then
-            echo "No workers.dev URL found in the deploy output; skipping the smoke test."
+          # Some accounts cannot serve *.workers.dev at all (every Worker answers
+          # with a Cloudflare error page) while custom domains work fine. Anyone
+          # in that situation passes smoke_url and the test targets it instead.
+          target="${SMOKE_URL:-${DEPLOYED_URL:-}}"
+          if [ -z "$target" ]; then
+            echo "Neither smoke_url nor a workers.dev URL is available; skipping the smoke test."
             exit 0
           fi
+          target="${target%/}"
+          echo "Smoke testing ${target}/api/config"
 
           # /api/config only answers once D1 has been reached and initialized,
           # so a 200 proves the deployed bindings actually work.
           for attempt in 1 2 3 4 5; do
-            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${DEPLOYED_URL}/api/config" || true)"
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${target}/api/config" || true)"
             echo "Attempt ${attempt}: GET /api/config -> ${status:-no response}"
             if [ "$status" = "200" ]; then
               echo "Worker is serving the Bitwarden config endpoint."
@@ -386,7 +398,7 @@ jobs:
             sleep 5
           done
 
-          echo "::warning::Smoke test against ${DEPLOYED_URL}/api/config did not return HTTP 200. Check the Worker logs plus the D1 and JWT_SECRET configuration."
+          echo "::warning::Smoke test against ${target}/api/config did not return HTTP 200. Check the Worker logs plus the D1 and JWT_SECRET configuration."
 
       - name: Write job summary
         if: always()

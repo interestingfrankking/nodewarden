@@ -73,6 +73,7 @@ workflow 会在仓库根目录临时生成一个 `wrangler.ci.toml`（已加入 
 | `mode` | `r2` | 附件存储方式：`r2`（需要绑定支付方式，单文件 100 MB，免费 10 GB）或 `kv`（无需绑卡，单文件 25 MiB，免费 1 GB） |
 | `worker_name` | `nodewarden` | Worker 名称，也是 `https://<名称>.<你的子域>.workers.dev` |
 | `custom_domain` | 空 | 例如 `vault.example.com`；填了会同时绑定自定义域名，域名必须已经托管在同一个 Cloudflare 账号 |
+| `smoke_url` | 空 | 部署后冒烟测试用的地址，例如 `https://node.example.com`；留空则用部署输出里的 `*.workers.dev`。**某些账号的 `workers.dev` 整体不可用**（每个 Worker 都返回 Cloudflare 错误页），这时必须填这一项，否则冒烟测试会误报 |
 | `d1_database_name` | `nodewarden-db` | D1 数据库名 |
 | `r2_bucket_name` | `nodewarden-attachments` | R2 存储桶名（`r2` 模式） |
 | `kv_namespace_title` | `nodewarden-attachments-kv` | KV 命名空间名称（`kv` 模式） |
@@ -107,6 +108,11 @@ workflow 检测不到它时会保留 Worker 上已有的值，只打印一条 wa
 **冒烟测试 `GET /api/config` 不是 200**
 说明 Worker 起来了但运行时有问题，常见原因：D1 绑定 id 不对、R2 没有开通、`JWT_SECRET` 太短。
 冒烟测试只是 `::warning::`，不会让部署失败，具体原因看 **Workers → 你的 Worker → Logs**。
+
+**`*.workers.dev` 一律返回 500 / “Worker threw exception”，但自定义域名正常**
+这是**账号级**的 `workers.dev` 限制（和 "被禁止使用 Workers Builds" 同一类账号限制），不是代码问题：
+账号里每个 Worker 的 `workers.dev` 地址都会返回同一种错误页，而自定义域名正常。
+这种情况下给 workflow 传 `smoke_url`（例如 `https://node.example.com`），不要让冒烟测试去查 `workers.dev`。
 
 **想清空数据重新开始**
 删除 Worker 不会删数据。需要同时删除对应的 D1 数据库、R2 存储桶 / KV 命名空间，
