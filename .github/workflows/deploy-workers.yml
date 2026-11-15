@@ -152,7 +152,34 @@ jobs:
           fi
 
           if [ "$DRY_RUN" = "true" ]; then
-            echo "Dry run: skipping the Cloudflare credential checks."
+            if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+              echo "Dry run: Cloudflare credentials are not configured, skipping the read-only checks."
+              exit 0
+            fi
+            echo "Dry run: READ-ONLY Cloudflare checks. Nothing is created, uploaded, or deployed."
+            "$WRANGLER_BIN" --version
+            "$WRANGLER_BIN" whoami || echo "::warning::wrangler whoami failed"
+            echo "Visible D1 databases:"
+            "$WRANGLER_BIN" d1 list --json | jq -r '.[] | "  \(.name)  \(.uuid)"' \
+              || echo "::warning::d1 list failed (the token may lack D1:Read)"
+            if [ "$DEPLOY_MODE" = "r2" ]; then
+              if "$WRANGLER_BIN" r2 bucket info "$R2_BUCKET_NAME" >/dev/null 2>&1; then
+                echo "R2 bucket '$R2_BUCKET_NAME' is readable."
+              else
+                echo "::warning::R2 bucket '$R2_BUCKET_NAME' not found or not readable."
+              fi
+            else
+              if "$WRANGLER_BIN" kv namespace list | jq -e --arg title "$KV_NAMESPACE_TITLE" "any(.[]; .title == \$title)" >/dev/null 2>&1; then
+                echo "KV namespace '$KV_NAMESPACE_TITLE' is readable."
+              else
+                echo "::warning::KV namespace '$KV_NAMESPACE_TITLE' not found or not readable."
+              fi
+            fi
+            if "$WRANGLER_BIN" deployments list --name "$WORKER_NAME" >/dev/null 2>&1; then
+              echo "Worker '$WORKER_NAME' is readable with this token."
+            else
+              echo "::warning::Worker '$WORKER_NAME' is not readable with this token (or does not exist yet)."
+            fi
             exit 0
           fi
 

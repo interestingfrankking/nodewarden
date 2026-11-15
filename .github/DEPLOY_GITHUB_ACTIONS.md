@@ -76,7 +76,7 @@ workflow 会在仓库根目录临时生成一个 `wrangler.ci.toml`（已加入 
 | `d1_database_name` | `nodewarden-db` | D1 数据库名 |
 | `r2_bucket_name` | `nodewarden-attachments` | R2 存储桶名（`r2` 模式） |
 | `kv_namespace_title` | `nodewarden-attachments-kv` | KV 命名空间名称（`kv` 模式） |
-| `dry_run` | `false` | 只构建 + 校验配置，不创建资源、不部署（这一步不需要任何 Secret，可以先跑一次确认流程通） |
+| `dry_run` | `false` | 只构建 + 校验配置，不创建资源、不部署。**配了 Cloudflare 凭据时会额外做只读体检**（`whoami` / `d1 list` / `r2 bucket info` / `deployments list`），可以据此确认 token 权限是否够 |
 
 首次部署完成后：
 
@@ -97,6 +97,12 @@ Token 权限不足，或 `CLOUDFLARE_ACCOUNT_ID` 不属于这个 token。检查�
 **部署成功但网页提示缺少 `JWT_SECRET`**
 Secret 没写进去。确认仓库里有 `JWT_SECRET`（不是 Variable），然后重跑一次；
 或到 Worker 的 **Settings → Variables and Secrets** 手动添加。
+
+**真实部署后是不是所有人都会被登出？**
+只有当你配置了 `JWT_SECRET`、且它的值与 Worker 上现有的密钥不同时才会。Cloudflare 的 secret
+创建后无法再读回，所以**想对已有 Worker 零影响就不要在 GitHub 里配置这个 secret**：
+workflow 检测不到它时会保留 Worker 上已有的值，只打印一条 warning。
+（新 Worker 必须配一个，否则页面会提示缺少 `JWT_SECRET`。）
 
 **冒烟测试 `GET /api/config` 不是 200**
 说明 Worker 起来了但运行时有问题，常见原因：D1 绑定 id 不对、R2 没有开通、`JWT_SECRET` 太短。
